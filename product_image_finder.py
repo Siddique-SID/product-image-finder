@@ -7,11 +7,10 @@ import json
 import re
 import time
 import unicodedata
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus
 
 import cv2
 import numpy as np
@@ -60,18 +59,61 @@ def slugify(text: str) -> str:
     return text[:150] or "product"
 
 
+def normalize_header(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+
 def find_columns(df: pd.DataFrame) -> tuple[str, str]:
-    normalized = {re.sub(r"[^a-z0-9]", "", str(c).lower()): c for c in df.columns}
-    name_keys = ("productname", "producttitle", "title", "name", "product")
-    qty_keys = ("quantity", "packsize", "size", "weight", "qty")
-    name_col = next((normalized[k] for k in name_keys if k in normalized), None)
-    qty_col = next((normalized[k] for k in qty_keys if k in normalized), None)
+    normalized = {normalize_header(column): column for column in df.columns}
+
+    name_exact = ("productname", "producttitle", "itemname", "itemtitle", "title", "name", "product")
+    quantity_exact = (
+        "quantitypacksize",
+        "quantitysize",
+        "packquantity",
+        "productquantity",
+        "productsize",
+        "quantity",
+        "packsize",
+        "size",
+        "weight",
+        "qty",
+    )
+
+    name_col = next((normalized[key] for key in name_exact if key in normalized), None)
+    qty_col = next((normalized[key] for key in quantity_exact if key in normalized), None)
+
+    if name_col is None:
+        name_col = next(
+            (
+                original
+                for header, original in normalized.items()
+                if ("product" in header or "item" in header) and ("name" in header or "title" in header)
+            ),
+            None,
+        )
+
+    if qty_col is None:
+        qty_col = next(
+            (
+                original
+                for header, original in normalized.items()
+                if any(token in header for token in ("quantity", "qty", "packsize", "weight", "volume", "size"))
+            ),
+            None,
+        )
+
     if not name_col or not qty_col:
-        raise ValueError(f"Could not identify product and quantity columns. Found: {list(df.columns)}")
+        raise ValueError(
+            "Could not identify product and quantity columns. "
+            f"Found: {list(df.columns)}. Expected names similar to Product Title and Quantity / Pack Size."
+        )
     return name_col, qty_col
 
 
 def load_products(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Input file not found: {path.resolve()}")
     suffix = path.suffix.lower()
     if suffix == ".csv":
         df = pd.read_csv(path)
@@ -84,7 +126,9 @@ def load_products(path: Path) -> pd.DataFrame:
     out.columns = ["Product Name", "Quantity"]
     out["Product Name"] = out["Product Name"].map(clean_text)
     out["Quantity"] = out["Quantity"].map(clean_text)
-    out = out[(out["Product Name"] != "")].drop_duplicates().reset_index(drop=True)
+    out = out[out["Product Name"] != ""].drop_duplicates().reset_index(drop=True)
+    print(f"Using columns: product='{name_col}', quantity='{qty_col}'")
+    print(f"Loaded {len(out)} unique product rows from {path.name}")
     return out
 
 
@@ -113,6 +157,7 @@ def search_candidates(product: str, quantity: str) -> list[Candidate]:
         f'"{product}" "{quantity}" packshot',
         f'{product} {quantity} English packaging',
         f'{product} {quantity} Arabic packaging',
+        f'{product} {quantity} Urdu packaging',
     ]
     seen: set[str] = set()
     results: list[Candidate] = []
@@ -147,15 +192,23 @@ def inspect_image(raw: bytes) -> tuple[Image.Image, dict[str, float]]:
     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     border = max(1, min(width, height) // 12)
     border_pixels = np.concatenate([
-        arr[:border].reshape(-1, 3), arr[-border:].reshape(-1, 3),
-        arr[:, :border].reshape(-1, 3), arr[:, -border:].reshape(-1, 3),
+        arr[:border].reshape(-1, 3),
+        arr[-border:].reshape(-1, 3),
+        arr[:, :border].reshape(-1, 3),
+        arr[:, -border:].reshape(-1, 3),
     ])
     white_ratio = float(np.mean(np.all(border_pixels >= 238, axis=1)))
     resolution_score = min(100.0, ((width * height) / (1200 * 1200)) * 100)
     sharpness_score = min(100.0, sharpness / 4)
     white_score = min(100.0, white_ratio * 125)
     quality_score = resolution_score * 0.35 + sharpness_score * 0.25 + white_score * 0.40
-    return image, {"width": width, "height": height, "sharpness": sharpness, "white_ratio": white_ratio, "quality_score": quality_score}
+    return image, {
+        "width": width,
+        "height": height,
+        "sharpness": sharpness,
+        "white_ratio": white_ratio,
+        "quality_score": quality_score,
+    }
 
 
 def textual_score(candidate: Candidate, product: str, quantity: str) -> float:
@@ -171,17 +224,30 @@ def ai_verify(raw: bytes, product: str, quantity: str) -> dict[str, Any]:
         return {"score": 0, "language": "unknown", "reason": "AI verification disabled"}
     try:
         from openai import OpenAI
+
         client = OpenAI(api_key=SETTINGS.openai_api_key)
         encoded = base64.b64encode(raw).decode("ascii")
         prompt = f"""Inspect this retail product image for a catalogue. Requested product: {product}. Requested quantity: {quantity}.
 Return JSON only with keys score (0-100), exact_product (boolean), exact_quantity (boolean), clean_background (boolean), language (English/Arabic/Urdu/Other/Unknown), and reason. Prefer English packaging but accept Arabic or Urdu. Penalise wrong variants, wrong quantity, shelf photos, collages, watermarks, and unclear images."""
         response = client.responses.create(
             model=SETTINGS.openai_vision_model,
-            input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}, {"type": "input_image", "image_url": f"data:image/jpeg;base64,{encoded}"}]}],
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{encoded}"},
+                    ],
+                }
+            ],
         )
         text = response.output_text.strip().removeprefix("```json").removesuffix("```").strip()
         data = json.loads(text)
-        return {"score": float(data.get("score", 0)), "language": data.get("language", "unknown"), "reason": data.get("reason", "")}
+        return {
+            "score": float(data.get("score", 0)),
+            "language": data.get("language", "unknown"),
+            "reason": data.get("reason", ""),
+        }
     except Exception as exc:
         return {"score": 0, "language": "unknown", "reason": f"AI error: {exc}"}
 
@@ -227,6 +293,7 @@ def process(input_path: Path, limit: int | None = None, start: int = 0) -> None:
         products = products.iloc[start:]
     if limit:
         products = products.head(limit)
+
     checkpoint = SETTINGS.cache_dir / "results.jsonl"
     done: set[str] = set()
     if checkpoint.exists():
@@ -236,6 +303,7 @@ def process(input_path: Path, limit: int | None = None, start: int = 0) -> None:
                 done.add(row["key"])
             except Exception:
                 pass
+
     records: list[dict[str, Any]] = []
     if checkpoint.exists():
         records = [json.loads(line) for line in checkpoint.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -245,14 +313,39 @@ def process(input_path: Path, limit: int | None = None, start: int = 0) -> None:
         key = hashlib.sha1(f"{product}|{quantity}".lower().encode()).hexdigest()
         if key in done:
             continue
+
         candidate, raw = choose_best(product, quantity)
         record: dict[str, Any] = {"key": key, "Product Name": product, "Quantity": quantity}
         if candidate and raw:
             filename = f"{slugify(product)}_{slugify(quantity)}.jpg"
             save_image(raw, SETTINGS.images_dir / filename)
-            record.update({"Status": "matched", "Image Filename": filename, "Image URL": candidate.image_url, "Source Page": candidate.page_url, "Score": candidate.final_score, "Language": candidate.language, "Width": candidate.width, "Height": candidate.height, "White Ratio": round(candidate.white_ratio, 3), "Reason": candidate.reason})
+            record.update(
+                {
+                    "Status": "matched",
+                    "Image Filename": filename,
+                    "Image URL": candidate.image_url,
+                    "Source Page": candidate.page_url,
+                    "Score": candidate.final_score,
+                    "Language": candidate.language,
+                    "Width": candidate.width,
+                    "Height": candidate.height,
+                    "White Ratio": round(candidate.white_ratio, 3),
+                    "Reason": candidate.reason,
+                }
+            )
         else:
-            record.update({"Status": "manual_review", "Image Filename": "", "Image URL": "", "Source Page": "", "Score": 0, "Language": "unknown", "Reason": "No candidate passed the configured checks"})
+            record.update(
+                {
+                    "Status": "manual_review",
+                    "Image Filename": "",
+                    "Image URL": "",
+                    "Source Page": "",
+                    "Score": 0,
+                    "Language": "unknown",
+                    "Reason": "No candidate passed the configured checks",
+                }
+            )
+
         with checkpoint.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         records.append(record)
