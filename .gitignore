@@ -1,0 +1,16 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+input/*.xlsx
+input/*.xls
+input/*.csv
+output/images/*
+output/reports/*
+output/cache/*
+!input/.gitkeep
+!output/images/.gitkeep
+!output/reports/.gitkeep
+!output/cache/.gitkeep
