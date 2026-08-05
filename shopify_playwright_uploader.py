@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 CHECKPOINT = Path("output/reports/shopify_playwright_checkpoint.jsonl")
 REPORT = Path("output/reports/shopify_playwright_report.xlsx")
@@ -105,24 +105,67 @@ def append_checkpoint(record: dict[str, Any]) -> None:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def wait_for_manual_login(page: Page, admin_url: str) -> None:
-    page.goto(admin_url, wait_until="domcontentloaded", timeout=60000)
-    print("\nShopify login opened in Chrome.")
-    print("1. Complete email/password, account selection and any verification in the browser.")
-    print("2. Make sure you can see the Shopify admin for this store.")
-    input("3. Return to Terminal and press ENTER only after the admin dashboard is visible... ")
+def is_admin_page(url: str, store_handle: str) -> bool:
+    lowered = url.lower()
+    return (
+        "admin.shopify.com" in lowered
+        and f"/store/{store_handle.lower()}" in lowered
+        and "accounts.shopify.com" not in lowered
+        and "login" not in lowered
+    )
 
-    page.goto(admin_url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(2500)
-    current = page.url.lower()
-    if "accounts.shopify.com" in current or "login" in current:
-        raise RuntimeError(
-            "Shopify is still showing the login page. Complete the login in Chrome, then run the command again. "
-            "The saved browser profile will reuse the session."
-        )
-    if f"/store/{admin_url.rstrip('/').split('/')[-1]}" not in current:
-        print(f"Warning: current page is {page.url}")
-    print("Login confirmed. The browser session has been saved.\n")
+
+def wait_for_manual_login(
+    context: BrowserContext,
+    page: Page,
+    admin_url: str,
+    store_handle: str,
+) -> Page:
+    try:
+        page.goto(admin_url, wait_until="domcontentloaded", timeout=60000)
+    except Exception as exc:
+        if page.is_closed():
+            page = context.new_page()
+            page.goto(admin_url, wait_until="domcontentloaded", timeout=60000)
+        else:
+            print(f"Initial Shopify navigation warning: {exc}")
+
+    print("\nShopify login opened in the browser.")
+    print("1. Complete email/password, account selection and any verification.")
+    print("2. Make sure the Shopify admin dashboard for the correct store is visible.")
+    input("3. Return to Terminal and press ENTER after the dashboard is visible... ")
+
+    # Shopify may open the authenticated admin in a different tab. Search every
+    # open page instead of checking only the original login tab.
+    for candidate in reversed(context.pages):
+        try:
+            if not candidate.is_closed() and is_admin_page(candidate.url, store_handle):
+                candidate.bring_to_front()
+                print(f"Login confirmed in browser tab: {candidate.url}\n")
+                return candidate
+        except Exception:
+            continue
+
+    # The dashboard might be visible but its URL has not settled yet. Try the
+    # store admin URL once in each remaining open tab using the saved session.
+    for candidate in reversed(context.pages):
+        if candidate.is_closed():
+            continue
+        try:
+            candidate.goto(admin_url, wait_until="domcontentloaded", timeout=60000)
+            candidate.wait_for_timeout(2500)
+            if is_admin_page(candidate.url, store_handle):
+                candidate.bring_to_front()
+                print(f"Login confirmed: {candidate.url}\n")
+                return candidate
+        except Exception:
+            continue
+
+    open_urls = [p.url for p in context.pages if not p.is_closed()]
+    raise RuntimeError(
+        "Shopify login could not be confirmed. Keep the Shopify dashboard open in the automation browser, "
+        "then run the command again. Open browser URLs were: " + " | ".join(open_urls)
+    )
 
 
 def has_existing_media(page: Page) -> bool:
@@ -215,7 +258,7 @@ def main() -> None:
     with sync_playwright() as p:
         context = launch_context(p, args.use_playwright_chromium)
         page = context.pages[0] if context.pages else context.new_page()
-        wait_for_manual_login(page, admin_base)
+        page = wait_for_manual_login(context, page, admin_base, args.store)
 
         if args.login_only:
             print("Login session saved. You can now run the upload command without --login-only.")
