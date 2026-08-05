@@ -28,13 +28,22 @@ def numeric_product_id(value: Any) -> str:
 
 
 def load_rows(catalogue: Path, images_dir: Path) -> list[dict[str, str]]:
+    if not catalogue.exists():
+        raise FileNotFoundError(f"Catalogue not found: {catalogue}")
+    if not images_dir.exists() or not images_dir.is_dir():
+        raise FileNotFoundError(f"Images folder not found: {images_dir}")
+
     df = pd.read_excel(catalogue, sheet_name="Products")
     required = {"Product Title", "Quantity / Pack Size", "Product ID"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    image_lookup = {p.name.lower(): p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}}
+    image_lookup = {
+        p.name.lower(): p
+        for p in images_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    }
     rows: list[dict[str, str]] = []
 
     for _, row in df.iterrows():
@@ -43,7 +52,7 @@ def load_rows(catalogue: Path, images_dir: Path) -> list[dict[str, str]]:
         product_id = numeric_product_id(row.get("Product ID"))
         matched_name = clean(row.get("Matched Image Filename")) if "Matched Image Filename" in df.columns else ""
 
-        candidate_names = []
+        candidate_names: list[str] = []
         if matched_name:
             candidate_names.append(matched_name)
         candidate_names.extend([
@@ -52,7 +61,9 @@ def load_rows(catalogue: Path, images_dir: Path) -> list[dict[str, str]]:
             f"{title}.png",
             f"{title}.webp",
             f"{title} {quantity}.jpg",
+            f"{title} {quantity}.jpeg",
             f"{title} {quantity}.png",
+            f"{title} {quantity}.webp",
         ])
 
         image_path: Path | None = None
@@ -69,6 +80,8 @@ def load_rows(catalogue: Path, images_dir: Path) -> list[dict[str, str]]:
                 "product_id": product_id,
                 "image_path": str(image_path.resolve()),
             })
+
+    print(f"Matched {len(rows)} catalogue products to local image files.")
     return rows
 
 
@@ -92,11 +105,24 @@ def append_checkpoint(record: dict[str, Any]) -> None:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def wait_for_login(page: Page, admin_url: str) -> None:
-    page.goto(admin_url, wait_until="domcontentloaded")
-    if "login" in page.url.lower() or "accounts.shopify.com" in page.url.lower():
-        print("Log in to Shopify in the opened browser. The script will continue after the admin page loads.")
-    page.wait_for_url(re.compile(r"https://admin\.shopify\.com/store/.+"), timeout=0)
+def wait_for_manual_login(page: Page, admin_url: str) -> None:
+    page.goto(admin_url, wait_until="domcontentloaded", timeout=60000)
+    print("\nShopify login opened in Chrome.")
+    print("1. Complete email/password, account selection and any verification in the browser.")
+    print("2. Make sure you can see the Shopify admin for this store.")
+    input("3. Return to Terminal and press ENTER only after the admin dashboard is visible... ")
+
+    page.goto(admin_url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2500)
+    current = page.url.lower()
+    if "accounts.shopify.com" in current or "login" in current:
+        raise RuntimeError(
+            "Shopify is still showing the login page. Complete the login in Chrome, then run the command again. "
+            "The saved browser profile will reuse the session."
+        )
+    if f"/store/{admin_url.rstrip('/').split('/')[-1]}" not in current:
+        print(f"Warning: current page is {page.url}")
+    print("Login confirmed. The browser session has been saved.\n")
 
 
 def has_existing_media(page: Page) -> bool:
@@ -150,14 +176,33 @@ def save_product(page: Page) -> None:
     time.sleep(2)
 
 
+def launch_context(playwright: Any, use_chromium: bool):
+    kwargs: dict[str, Any] = {
+        "user_data_dir": str(PROFILE_DIR),
+        "headless": False,
+        "viewport": {"width": 1440, "height": 1000},
+    }
+    if not use_chromium:
+        kwargs["channel"] = "chrome"
+    try:
+        return playwright.chromium.launch_persistent_context(**kwargs)
+    except Exception as exc:
+        if not use_chromium:
+            print(f"Could not open installed Google Chrome ({exc}). Falling back to Playwright Chromium.")
+            kwargs.pop("channel", None)
+            return playwright.chromium.launch_persistent_context(**kwargs)
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Upload matched product images through Shopify Admin using Playwright.")
     parser.add_argument("catalogue", type=Path)
     parser.add_argument("images", type=Path)
     parser.add_argument("--store", required=True, help="Shopify store handle used in admin.shopify.com/store/<handle>")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--headed", action="store_true", help="Kept for compatibility; browser is headed by default")
     parser.add_argument("--replace", action="store_true", help="Upload even when existing media is detected")
+    parser.add_argument("--login-only", action="store_true", help="Open Shopify, save the login session, then exit")
+    parser.add_argument("--use-playwright-chromium", action="store_true", help="Use bundled Chromium instead of installed Google Chrome")
     args = parser.parse_args()
 
     rows = load_rows(args.catalogue, args.images)
@@ -165,17 +210,17 @@ def main() -> None:
         rows = rows[: args.limit]
 
     done = completed_ids()
-    records: list[dict[str, Any]] = []
     admin_base = f"https://admin.shopify.com/store/{args.store}"
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            str(PROFILE_DIR),
-            headless=False,
-            viewport={"width": 1440, "height": 1000},
-        )
+        context = launch_context(p, args.use_playwright_chromium)
         page = context.pages[0] if context.pages else context.new_page()
-        wait_for_login(page, admin_base)
+        wait_for_manual_login(page, admin_base)
+
+        if args.login_only:
+            print("Login session saved. You can now run the upload command without --login-only.")
+            context.close()
+            return
 
         for index, row in enumerate(rows, start=1):
             product_id = row["product_id"]
@@ -186,14 +231,14 @@ def main() -> None:
             try:
                 print(f"[{index}/{len(rows)}] {row['title']} — {row['quantity']}")
                 page.goto(f"{admin_base}/products/{product_id}", wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(2500)
 
                 if has_existing_media(page) and not args.replace:
                     record["status"] = "skipped_existing_media"
                     record["message"] = "Product already appears to have media"
                 else:
                     upload_image(page, row["image_path"])
-                    page.wait_for_timeout(4000)
+                    page.wait_for_timeout(5000)
                     save_product(page)
                     record["status"] = "uploaded"
                     record["message"] = "Image uploaded and product saved"
@@ -202,7 +247,6 @@ def main() -> None:
                 record["message"] = str(exc)
 
             append_checkpoint(record)
-            records.append(record)
             time.sleep(1.5)
 
         context.close()
