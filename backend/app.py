@@ -19,7 +19,7 @@ SERVERLESS = os.getenv('VERCEL') == '1'
 if SERVERLESS:
     os.environ.setdefault('MAX_CANDIDATES', '3')
     os.environ.setdefault('REQUEST_TIMEOUT', '5')
-from product_image_finder import load_products, search_candidates, download_bytes, inspect_image, textual_score, save_image
+from product_image_finder import load_products, search_candidates, download_bytes, inspect_image, textual_score, save_image, SearchUnavailable
 from config import SETTINGS
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -228,27 +228,41 @@ def process_job(job_id, batch_size=None):
         if product['status'] != 'pending': continue
         candidates = []
         errors = 0
-        for candidate in search_candidates(product['name'], product['quantity']):
+        search_error = ''
+        try:
+            discovered = search_candidates(product['name'], product['quantity'])
+        except SearchUnavailable as exc:
+            discovered = []; search_error = str(exc)
+        for candidate in discovered:
             try:
                 raw = download_bytes(candidate.image_url)
                 _, metrics = inspect_image(raw)
                 for key, value in metrics.items(): setattr(candidate, key, value)
                 candidate.text_score = textual_score(candidate, product['name'], product['quantity'])
-                if candidate.width < SETTINGS.min_width or candidate.height < SETTINGS.min_height or candidate.white_ratio < SETTINGS.min_white_ratio: continue
+                warnings = [candidate.reason] if candidate.reason else []
+                if candidate.width < SETTINGS.min_width or candidate.height < SETTINGS.min_height:
+                    warnings.append('Below preferred resolution; check image quality before export.')
+                if candidate.white_ratio < SETTINGS.min_white_ratio:
+                    warnings.append('Background is not predominantly white; check before approval.')
+                candidate.reason = ' '.join(warnings)
                 filename = f'{product["id"]}-{len(candidates)}.jpg'
                 store_image(job_id, filename, raw)
                 data = asdict(candidate)
                 # No AI verification is performed in this first version.
                 data.update(filename=filename, score=round(candidate.quality_score * .6 + candidate.text_score * .4, 1))
                 candidates.append(data)
+                if len(candidates) >= SETTINGS.max_candidates: break
             except Exception: errors += 1
-        candidates.sort(key=lambda c: c['score'], reverse=True)
+        candidates.sort(key=lambda c: ('Pack size differs' in c['reason'] or 'Source pack size is unspecified' in c['reason'], bool(c['reason']), -c['score']))
         with lock:
             job = read(job_id, internal=True)
             if job['status'] in ('cancelled','cancelling'):
                 job['status'] = 'cancelled'; write(job); return
             product = job['products'][index]
-            product.update(candidates=candidates, selected=0 if candidates else None, status='review', reason='' if candidates else 'No usable image found. Search may be blocked or no image passed the quality checks. Upload an image to resolve this product.')
+            reason = '' if candidates else (search_error or (
+                f'Found {len(discovered)} image links, but none could be downloaded or decoded. Retry or upload an image.'
+                if errors else 'No matching product image found. Check the product name and pack size, or upload an image.'))
+            product.update(candidates=candidates, selected=0 if candidates else None, status='review', reason=reason)
             job['processed'] = sum(p['status'] != 'pending' for p in job['products'])
             write(job)
         processed += 1

@@ -7,6 +7,8 @@ import backend.app as api
 from product_image_finder import Candidate
 from backend.storage import Store
 from backend import accounts
+from unittest.mock import patch
+from product_image_finder import SearchUnavailable
 
 class Workflow(unittest.TestCase):
     def setUp(self):
@@ -58,5 +60,27 @@ class Workflow(unittest.TestCase):
                 self.assertEqual(client.post(f'/api/jobs/{jid}/products/0/image',files={'file':('new.png',raw.getvalue(),'image/png')}).status_code,200)
                 self.assertEqual(api.read(jid)['products'][0]['status'],'review')
             finally: api.DATA=original; api.search_candidates=search; api.download_bytes=download
+
+    def test_search_failure_is_saved_as_an_actionable_reason(self):
+        client=TestClient(api.app)
+        jid=client.post('/api/jobs',files={'file':('products.csv',b'Product Name,Quantity\nExample Sauce,700g','text/csv')}).json()['id']
+        with patch.object(api, 'search_candidates', side_effect=SearchUnavailable('Image search provider is blocked. Retry later.')):
+            api.run(jid)
+        job=client.get(f'/api/jobs/{jid}').json()
+        self.assertEqual(job['status'], 'complete')
+        self.assertIn('provider is blocked', job['products'][0]['reason'])
+
+    def test_small_images_remain_reviewable_with_warnings(self):
+        client=TestClient(api.app)
+        jid=client.post('/api/jobs',files={'file':('products.csv',b'Product Name,Quantity\nExample Sauce,700g','text/csv')}).json()['id']
+        raw=BytesIO(); Image.new('RGB',(300,300),'blue').save(raw,'PNG')
+        with patch.object(api, 'search_candidates', return_value=[Candidate('https://example.org/image.png',title='Example Sauce 500g',reason='Pack size differs: 500g instead of 700g.')]), patch.object(api, 'download_bytes',return_value=raw.getvalue()):
+            api.run(jid)
+        product=client.get(f'/api/jobs/{jid}').json()['products'][0]
+        self.assertEqual(len(product['candidates']), 1)
+        self.assertEqual(product['status'], 'review')
+        self.assertIn('Pack size differs', product['candidates'][0]['reason'])
+        self.assertIn('Below preferred resolution', product['candidates'][0]['reason'])
+        self.assertIn('not predominantly white', product['candidates'][0]['reason'])
 
 if __name__=='__main__': unittest.main()

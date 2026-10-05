@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -139,10 +140,12 @@ def load_products(path: Path) -> pd.DataFrame:
 def ddg_search(query: str, limit: int) -> list[Candidate]:
     session = requests.Session()
     session.headers.update(HEADERS)
-    html = session.get("https://duckduckgo.com/", params={"q": query}, timeout=SETTINGS.request_timeout).text
+    response = session.get("https://duckduckgo.com/", params={"q": query}, timeout=SETTINGS.request_timeout)
+    response.raise_for_status()
+    html = response.text
     match = re.search(r'vqd=["\']?([\d-]+)', html)
     if not match:
-        return []
+        raise SearchUnavailable('Web image search did not return a search token.')
     params = {"l": "uk-en", "o": "json", "q": query, "vqd": match.group(1), "f": ",,,", "p": "1"}
     response = session.get("https://duckduckgo.com/i.js", params=params, timeout=SETTINGS.request_timeout)
     response.raise_for_status()
@@ -155,27 +158,86 @@ def ddg_search(query: str, limit: int) -> list[Candidate]:
     return candidates
 
 
-def search_candidates(product: str, quantity: str) -> list[Candidate]:
-    queries = [
-        f'"{product}" "{quantity}" product white background',
-        f'"{product}" "{quantity}" packshot',
-        f'{product} {quantity} English packaging',
-        f'{product} {quantity} Arabic packaging',
-        f'{product} {quantity} Urdu packaging',
-    ]
-    seen: set[str] = set()
-    results: list[Candidate] = []
-    for query in queries:
-        try:
-            for item in ddg_search(query, SETTINGS.max_candidates):
-                if item.image_url not in seen:
-                    seen.add(item.image_url)
-                    results.append(item)
-                if len(results) >= SETTINGS.max_candidates:
-                    return results
-        except requests.RequestException:
+class SearchUnavailable(RuntimeError):
+    pass
+
+
+# Public product catalogues: no paid search API or customer credentials.
+CATALOGUE_SOURCES = (
+    'https://swadindia.in', 'https://www.kwfood.co.uk',
+    'https://damasgate.store', 'https://superdokan.com/en-lb',
+)
+
+
+def product_tokens(value: str) -> set[str]:
+    value = unicodedata.normalize('NFKD', value).casefold()
+    value = re.sub(r'\b(?:\d+(?:\.\d+)?)\s*(?:kg|g|ml|l|ltr|litre|liter)\b', ' ', value)
+    return {('sauce' if t == 'sauces' else t) for t in re.findall(r'[a-z]+', value)
+            if t not in {'the', 'and', 'with', 'of', 'product'}}
+
+
+def pack_sizes(value: str) -> set[tuple[float, str]]:
+    sizes = set()
+    for number, unit in re.findall(r'(\d+(?:\.\d+)?)\s*(kg|ml|ltr|litre|liter|g|l)\b', value.casefold()):
+        factor = 1000 if unit in ('kg', 'l', 'ltr', 'litre', 'liter') else 1
+        sizes.add((float(number) * factor, 'g' if unit in ('g', 'kg') else 'ml'))
+    return sizes
+
+
+def catalogue_search(source: str, product: str, quantity: str) -> list[Candidate]:
+    response = requests.get(source + '/search/suggest.json', params={
+        'q': product, 'resources[type]': 'product', 'resources[limit]': 10,
+        'resources[options][fields]': 'title,variants.title',
+    }, headers=HEADERS, timeout=SETTINGS.request_timeout)
+    response.raise_for_status()
+    rows = response.json()['resources']['results']['products']
+    wanted = product_tokens(product)
+    sizes = pack_sizes(quantity)
+    candidates = []
+    for row in rows:
+        title = row.get('title', '')
+        # Predictive search also returns unrelated recommendations. Never accept them.
+        if not wanted or not wanted.issubset(product_tokens(title)):
             continue
-    return results
+        image = row.get('image')
+        if isinstance(image, dict): image = image.get('url') or image.get('src')
+        if not isinstance(image, str) or not image: continue
+        offered = pack_sizes(title)
+        reason = ''
+        if sizes and not sizes.intersection(offered):
+            reason = (f'Pack size differs: source lists {title}; your catalogue requests {quantity}.'
+                      if offered else f'Source pack size is unspecified. Check against {quantity}.')
+        candidates.append(Candidate(image_url=urljoin(source + '/', image),
+            page_url=urljoin(source + '/', row.get('url', '')), title=title,
+            source=urlsplit(source).hostname or 'catalogue', reason=reason))
+    return candidates
+
+
+def search_candidates(product: str, quantity: str) -> list[Candidate]:
+    results = []
+    successful = 0
+    with ThreadPoolExecutor(max_workers=len(CATALOGUE_SOURCES)) as pool:
+        futures = [pool.submit(catalogue_search, source, product, quantity) for source in CATALOGUE_SOURCES]
+        for future in futures:
+            try:
+                results.extend(future.result()); successful += 1
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                continue
+    if not results:
+        try:
+            results = ddg_search(f'{product} {quantity} product', max(8, SETTINGS.max_candidates * 3))
+            successful += 1
+        except (requests.RequestException, ValueError, SearchUnavailable):
+            if not successful:
+                raise SearchUnavailable('Image search providers are unavailable or blocking requests. Retry later or upload an image.')
+            raise SearchUnavailable('No matching image in the supported retailer catalogues, and web image search is blocked or unavailable. Try a more specific product name or upload an image.')
+    results.sort(key=lambda c: (bool(c.reason), len(product_tokens(c.title) - product_tokens(product))))
+    seen = set()
+    unique = []
+    for candidate in results:
+        if candidate.image_url not in seen:
+            seen.add(candidate.image_url); unique.append(candidate)
+    return unique[:min(12, max(8, SETTINGS.max_candidates * 3))]
 
 
 def validate_image_url(url: str) -> None:
