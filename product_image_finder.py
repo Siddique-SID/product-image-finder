@@ -7,6 +7,9 @@ import json
 import re
 import time
 import unicodedata
+import ipaddress
+import socket
+from urllib.parse import urlsplit, urljoin
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -23,6 +26,7 @@ from tqdm import tqdm
 from config import SETTINGS
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = 20_000_000
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 
 
@@ -174,18 +178,38 @@ def search_candidates(product: str, quantity: str) -> list[Candidate]:
     return results
 
 
+def validate_image_url(url: str) -> None:
+    parts = urlsplit(url)
+    if parts.scheme not in ('http', 'https') or not parts.hostname or parts.username or parts.password:
+        raise ValueError('Use a public HTTP image URL')
+    if parts.port not in (None, 80, 443): raise ValueError('Unsupported image port')
+    addresses = socket.getaddrinfo(parts.hostname, parts.port or (443 if parts.scheme == 'https' else 80), type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(row[4][0]).is_global for row in addresses):
+        raise ValueError('Private network image URLs are not allowed')
+
+
 def download_bytes(url: str) -> bytes:
-    response = requests.get(url, headers=HEADERS, timeout=SETTINGS.request_timeout, allow_redirects=True)
-    response.raise_for_status()
-    if "image" not in response.headers.get("content-type", "").lower():
-        raise ValueError("URL did not return an image")
-    if len(response.content) > 15_000_000:
-        raise ValueError("Image is too large")
-    return response.content
+    for _ in range(5):
+        validate_image_url(url)
+        with requests.get(url, headers=HEADERS, timeout=SETTINGS.request_timeout, allow_redirects=False, stream=True) as response:
+            if response.is_redirect:
+                url = urljoin(url, response.headers.get('location', ''))
+                continue
+            response.raise_for_status()
+            if 'image' not in response.headers.get('content-type', '').lower():
+                raise ValueError('URL did not return an image')
+            raw = bytearray()
+            for chunk in response.iter_content(65536):
+                raw.extend(chunk)
+                if len(raw) > 15_000_000: raise ValueError('Image is too large')
+            return bytes(raw)
+    raise ValueError('Too many image redirects')
 
 
 def inspect_image(raw: bytes) -> tuple[Image.Image, dict[str, float]]:
-    image = Image.open(BytesIO(raw)).convert("RGB")
+    image = Image.open(BytesIO(raw))
+    if image.width * image.height > 20_000_000: raise ValueError("Image exceeds 20 megapixels")
+    image = image.convert("RGB")
     width, height = image.size
     arr = np.asarray(image)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
@@ -280,7 +304,9 @@ def choose_best(product: str, quantity: str) -> tuple[Candidate | None, bytes | 
 
 
 def save_image(raw: bytes, destination: Path) -> None:
-    image = Image.open(BytesIO(raw)).convert("RGB")
+    image = Image.open(BytesIO(raw))
+    if image.width * image.height > 20_000_000: raise ValueError("Image exceeds 20 megapixels")
+    image = image.convert("RGB")
     canvas = Image.new("RGB", image.size, "white")
     canvas.paste(image)
     canvas.save(destination, "JPEG", quality=94, optimize=True)

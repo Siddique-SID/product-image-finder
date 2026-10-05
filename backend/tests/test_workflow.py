@@ -5,8 +5,19 @@ from PIL import Image
 from fastapi.testclient import TestClient
 import backend.app as api
 from product_image_finder import Candidate
+from backend.storage import Store
+from backend import accounts
 
 class Workflow(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.old_store=api.store
+        api.store=Store(Path(self.temp.name)/'test.sqlite3')
+        accounts._attempts.clear()
+    def tearDown(self):
+        api.store=self.old_store
+        self.temp.cleanup()
+
     def test_hosted_password_gate(self):
         original=api.APP_PASSWORD
         api.APP_PASSWORD='test-only-password'
