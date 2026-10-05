@@ -14,3 +14,9 @@ output/cache/*
 !output/images/.gitkeep
 !output/reports/.gitkeep
 !output/cache/.gitkeep
+
+# PWA dependencies and build output
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.pyc

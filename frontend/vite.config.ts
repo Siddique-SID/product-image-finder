@@ -1,0 +1,4 @@
+import {defineConfig} from 'vite';
+import react from '@vitejs/plugin-react';
+import {VitePWA} from 'vite-plugin-pwa';
+export default defineConfig({plugins:[react(),VitePWA({registerType:'prompt',includeAssets:['icon-192.png','icon-512.png'],manifest:{name:'Product Image Finder by Siddique Sayed',short_name:'Image Finder',description:'Find and review catalogue images',theme_color:'#171923',background_color:'#f5f6f8',display:'standalone',start_url:'/',icons:[{src:'/icon-192.png',sizes:'192x192',type:'image/png'},{src:'/icon-512.png',sizes:'512x512',type:'image/png'}]},workbox:{globPatterns:['**/*.{js,css,html,png}'],navigateFallbackDenylist:[/^\/api/],runtimeCaching:[{urlPattern:/\/api\/jobs\/[^/]+\/images\//,handler:'CacheFirst',options:{cacheName:'review-images',expiration:{maxEntries:200,maxAgeSeconds:604800}}}]}})],server:{proxy:{'/api':'http://127.0.0.1:8000'}}});

@@ -126,3 +126,33 @@ rm -f output/reports/*
 ```
 
 Then run the script again.
+
+## PWA studio — by Siddique Sayed
+
+The `feat/product-finder-pwa` branch adds a React + TypeScript customer interface and a FastAPI adapter around the existing search and image-quality functions. The original CLI remains available.
+
+### Run locally
+
+From the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+cd frontend
+npm ci
+npm run build
+cd ..
+python3 -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
+```
+
+Open http://localhost:8000. For frontend development, run `npm run dev` in `frontend/` with the backend still running.
+
+1. Upload a CSV/XLSX with product name and quantity columns (up to 500 products / 10 MB).
+2. Check the detected catalogue before selecting **Find images**.
+3. Review candidates, their resolution, white border estimate and source page. Approve, reject or upload a replacement.
+4. Export CSV/XLSX reports or a ZIP containing only approved images.
+
+Jobs and review decisions persist under `output/pwa/`. Run one backend worker; jobs are processed sequentially. Interrupted jobs can resume after restart. The PWA caches its interface and viewed candidate images; previously fetched job metadata remains in this browser. Offline uploads and review changes are disabled. Install via the browser's install option (iPhone: Share → Add to Home Screen). Installation requires HTTPS or localhost.
+
+This version is intended for a single user on a local machine. It does not include authentication or multi-user isolation and should not be exposed publicly without those additions. AI verification and Shopify publishing are not wired into the PWA yet. Search uses the existing DuckDuckGo engine and may be rate limited or blocked; unsuccessful products go to manual review. The app uses temporary SS initials icons until the selected logo asset is supplied.
