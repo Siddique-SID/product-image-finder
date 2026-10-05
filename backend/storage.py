@@ -1,12 +1,19 @@
 """Small durable repository. PostgreSQL in production, SQLite for local use."""
 import json
 import sqlite3
+import hashlib
+import threading
+from contextvars import ContextVar
 from contextlib import contextmanager
 
 
 class Store:
     def __init__(self, path, database_url=''):
         self.path, self.url = str(path), database_url
+        self._transaction = ContextVar('store_transaction', default=None)
+        self._lock = threading.RLock()
+        # Hosted tables are provisioned explicitly; cold starts never change schema.
+        if self.url: return
         with self.connection() as db:
             blob = 'BYTEA' if self.url else 'BLOB'
             db.execute('CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL, password TEXT NOT NULL, recovery TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1)')
@@ -16,16 +23,24 @@ class Store:
 
     @contextmanager
     def connection(self):
+        active = self._transaction.get()
+        if active is not None:
+            yield active
+            return
         if self.url:
             import psycopg
             from psycopg.rows import dict_row
-            raw = psycopg.connect(self.url, row_factory=dict_row, connect_timeout=10)
+            raw = psycopg.connect(self.url, row_factory=dict_row, connect_timeout=10, prepare_threshold=None)
         else:
             raw = sqlite3.connect(self.path, timeout=15)
             raw.row_factory = sqlite3.Row
         class DB:
             def execute(_, sql, params=()):
-                return raw.execute(sql.replace('?', '%s') if self.url else sql, params)
+                if self.url:
+                    import re
+                    sql = re.sub(r'\b(users|invites|jobs|images)\b', r'studio.\1', sql)
+                    sql = sql.replace('?', '%s')
+                return raw.execute(sql, params)
         try:
             yield DB()
             raw.commit()
@@ -34,6 +49,18 @@ class Store:
             raise
         finally:
             raw.close()
+
+    @contextmanager
+    def job_lock(self, jid):
+        """Serialize a catalogue across instances, including transaction poolers."""
+        from fastapi import HTTPException
+        key = int.from_bytes(hashlib.sha256(jid.encode()).digest()[:8], 'big', signed=True)
+        with self._lock, self.connection() as db:
+            if self.url and not db.execute('SELECT pg_try_advisory_xact_lock(?) AS acquired', (key,)).fetchone()['acquired']:
+                raise HTTPException(409, 'This catalogue is busy. Try again after the current product finishes.')
+            token = self._transaction.set(db)
+            try: yield
+            finally: self._transaction.reset(token)
 
     def invite(self, code, expires):
         with self.connection() as db:

@@ -1,0 +1,4 @@
+# Optional dependencies for the CLI's browser and AI verification modes.
+-r requirements.txt
+openai>=1.40
+playwright>=1.54
