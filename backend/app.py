@@ -15,19 +15,25 @@ from pydantic import BaseModel, Field
 from contextvars import ContextVar
 from backend.storage import Store
 from backend.accounts import hash_password, verify, throttle
+SERVERLESS = os.getenv('VERCEL') == '1'
+if SERVERLESS:
+    os.environ.setdefault('MAX_CANDIDATES', '3')
+    os.environ.setdefault('REQUEST_TIMEOUT', '5')
 from product_image_finder import load_products, search_candidates, download_bytes, inspect_image, textual_score, save_image
 from config import SETTINGS
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = Path(os.getenv('DATA_DIR', str(ROOT / 'output' / 'pwa')))
+DATA = Path('/tmp/product-studio' if SERVERLESS else os.getenv('DATA_DIR', str(ROOT / 'output' / 'pwa')))
 DATA.mkdir(parents=True, exist_ok=True)
 lock = threading.RLock()
 pool = ThreadPoolExecutor(max_workers=1)
 app = FastAPI(title='Product Image Finder by Siddique Sayed')
 APP_PASSWORD = os.getenv('APP_PASSWORD', '')
-REQUIRE_AUTH = os.getenv('REQUIRE_AUTH', '').lower() == 'true'
+REQUIRE_AUTH = SERVERLESS or os.getenv('REQUIRE_AUTH', '').lower() == 'true'
 if REQUIRE_AUTH and (not APP_PASSWORD or not os.getenv('SESSION_SECRET')):
     raise RuntimeError('Set APP_PASSWORD and SESSION_SECRET before hosting this app')
+if SERVERLESS and not os.getenv('DATABASE_URL'):
+    raise RuntimeError('Set DATABASE_URL before deploying to Vercel; temporary storage is not supported')
 
 store = Store(DATA / 'studio.sqlite3', os.getenv('DATABASE_URL', ''))
 current_owner = ContextVar('current_owner', default='legacy')
@@ -71,12 +77,17 @@ async def protect_api(request: Request, call_next):
 app.add_middleware(SessionMiddleware, secret_key=os.getenv('SESSION_SECRET') or secrets.token_urlsafe(32), https_only=REQUIRE_AUTH, same_site='lax', max_age=86400)
 
 @app.get('/api/health')
-def health(): return {'status': 'ok'}
+def health():
+    try:
+        with store.connection() as db: db.execute('SELECT 1').fetchone()
+    except Exception:
+        raise HTTPException(503, 'Database is unavailable')
+    return {'status': 'ok'}
 
 @app.get('/api/session')
 def session(request: Request):
     user = identity(request)
-    return {'authenticated': bool(user), 'user': user, 'durable': bool(os.getenv('DATABASE_URL')), 'registration': bool(APP_PASSWORD)}
+    return {'authenticated': bool(user), 'user': user, 'durable': bool(os.getenv('DATABASE_URL')), 'registration': bool(APP_PASSWORD), 'request_processing': SERVERLESS, 'upload_limit': 4_000_000 if SERVERLESS else 10_000_000}
 
 class Login(BaseModel):
     email: str = Field(default='', max_length=254)
@@ -178,7 +189,7 @@ for path in DATA.glob('*/job.json'):
         for image_path in path.parent.glob('*.jpg'):
             store.put_image(old['id'], image_path.name, image_path.read_bytes())
         write(old)
-for job in store.jobs():
+for job in ([] if SERVERLESS else store.jobs()):
     if job['status'] in ('queued', 'running', 'cancelling'):
         job['status'] = 'cancelled' if job['status'] == 'cancelling' else 'interrupted'
         write(job)
@@ -190,6 +201,9 @@ def store_image(job_id, filename, raw):
     path = directory / filename
     save_image(raw, path)
     data = path.read_bytes()
+    if SERVERLESS and len(data) > 4_000_000:
+        path.unlink()
+        raise ValueError('Image is too large to serve; use an image under 4 MB')
     owner = read(job_id, internal=True).get('owner','legacy')
     with lock:
         if store.image_usage(owner) + len(data) > 100_000_000:
@@ -199,12 +213,13 @@ def store_image(job_id, filename, raw):
     path.unlink()
 
 
-def process_job(job_id):
+def process_job(job_id, batch_size=None):
     with lock:
         job = read(job_id, internal=True)
         if job['status'] in ('cancelled','cancelling'):
             job['status'] = 'cancelled'; write(job); return
         job['status'] = 'running'; write(job)
+    processed = 0
     for index in range(len(job['products'])):
         job = read(job_id, internal=True)
         if job['status'] in ('cancelled','cancelling'):
@@ -236,16 +251,18 @@ def process_job(job_id):
             product.update(candidates=candidates, selected=0 if candidates else None, status='review', reason='' if candidates else 'No usable image found. Search may be blocked or no image passed the quality checks. Upload an image to resolve this product.')
             job['processed'] = sum(p['status'] != 'pending' for p in job['products'])
             write(job)
+        processed += 1
+        if batch_size and processed >= batch_size: break
     with lock:
         job = read(job_id, internal=True)
         if job['status'] not in ('cancelled','cancelling'):
-            job['status'] = 'complete'; write(job)
+            job['status'] = 'queued' if any(p['status'] == 'pending' for p in job['products']) else 'complete'; write(job)
         elif job['status'] == 'cancelling':
             job['status'] = 'cancelled'; write(job)
 
-def run(job_id):
+def run(job_id, batch_size=None):
     try:
-        process_job(job_id)
+        process_job(job_id, batch_size)
     except Exception:
         with lock:
             job = read(job_id, internal=True)
@@ -264,8 +281,9 @@ def jobs():
 async def create(file: UploadFile):
     suffix = Path(file.filename or '').suffix.lower()
     if suffix not in ('.csv', '.xlsx'): raise HTTPException(400, 'Upload a CSV or XLSX file')
-    raw = await file.read(10_000_001)
-    if len(raw) > 10_000_000: raise HTTPException(413, 'Maximum catalogue size is 10 MB')
+    limit = 4_000_000 if SERVERLESS else 10_000_000
+    raw = await file.read(limit + 1)
+    if len(raw) > limit: raise HTTPException(413, f'Maximum catalogue size is {limit // 1_000_000} MB')
     if len(store.jobs(current_owner.get())) >= 30:
         raise HTTPException(429, 'Limit of 30 catalogues reached. Export your existing work first.')
     job_id = uuid.uuid4().hex
@@ -283,26 +301,36 @@ def get(job_id: str): return read(job_id)
 
 @app.post('/api/jobs/{job_id}/start')
 def start(job_id: str):
-    with lock:
+    with store.job_lock(job_id), lock:
         job = read(job_id)
         if job.get('archived') or job['status'] not in ('ready','interrupted','cancelled'): raise HTTPException(409,'This job has already started')
         if sum(j['status'] in ('queued','running') for j in store.jobs()) >= 20:
             raise HTTPException(429, 'Search queue is full. Try again shortly.')
         job['status']='queued'; write(job)
-        pool.submit(run,job_id)
+        if not SERVERLESS: pool.submit(run,job_id)
         return job
+
+@app.post('/api/jobs/{job_id}/advance')
+def advance(job_id: str):
+    read(job_id)  # Authorize before acquiring a database lock.
+    if not SERVERLESS: return read(job_id)
+    with store.job_lock(job_id), lock:
+        job = read(job_id)
+        if job['status'] in ('queued', 'running', 'cancelling'):
+            run(job_id, batch_size=1)
+        return read(job_id)
 
 @app.post('/api/jobs/{job_id}/cancel')
 def cancel(job_id: str):
-    with lock:
+    with store.job_lock(job_id), lock:
         job = read(job_id)
         if job['status'] not in ('running', 'queued'): raise HTTPException(409, 'Search is not running')
-        job['status'] = 'cancelling'; write(job)
+        job['status'] = 'cancelled' if SERVERLESS else 'cancelling'; write(job)
         return job
 
 @app.post('/api/jobs/{job_id}/retry')
 def retry(job_id: str):
-    with lock:
+    with store.job_lock(job_id), lock:
         job = read(job_id)
         if job['status'] not in ('complete', 'interrupted', 'cancelled'):
             raise HTTPException(409, 'Wait for the current search to stop')
@@ -314,7 +342,7 @@ def retry(job_id: str):
 
 @app.post('/api/jobs/{job_id}/archive')
 def archive(job_id: str):
-    with lock:
+    with store.job_lock(job_id), lock:
         job = read(job_id)
         if job['status'] in ('running','queued','cancelling'): raise HTTPException(409, 'Pause the search before archiving')
         job['archived'] = not job.get('archived', False)
@@ -327,7 +355,7 @@ class Decision(BaseModel):
 
 @app.post('/api/jobs/{job_id}/products/{product_id}')
 def decide(job_id: str, product_id: str, decision: Decision):
-    with lock:
+    with store.job_lock(job_id), lock:
         job = read(job_id)
         product = next((p for p in job['products'] if p['id']==product_id), None)
         if not product: raise HTTPException(404,'Product not found')
@@ -342,9 +370,10 @@ def decide(job_id: str, product_id: str, decision: Decision):
 
 @app.post('/api/jobs/{job_id}/products/{product_id}/image')
 async def replace(job_id: str, product_id: str, file: UploadFile):
-    raw = await file.read(15_000_001)
-    if len(raw)>15_000_000: raise HTTPException(413,'Maximum image size is 15 MB')
-    with lock:
+    limit = 4_000_000 if SERVERLESS else 15_000_000
+    raw = await file.read(limit + 1)
+    if len(raw)>limit: raise HTTPException(413,f'Maximum image size is {limit // 1_000_000} MB')
+    with store.job_lock(job_id), lock:
         job=read(job_id)
         p=next((p for p in job['products'] if p['id']==product_id),None)
         if not p: raise HTTPException(404,'Product not found')

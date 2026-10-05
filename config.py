@@ -17,11 +17,11 @@ class Settings:
     images_dir: Path = output_dir / "images"
     reports_dir: Path = output_dir / "reports"
     cache_dir: Path = output_dir / "cache"
-    max_candidates: int = int(os.getenv("MAX_CANDIDATES", "8"))
+    max_candidates: int = min(3, int(os.getenv("MAX_CANDIDATES", "8"))) if os.getenv('VERCEL') == '1' else int(os.getenv("MAX_CANDIDATES", "8"))
     min_width: int = int(os.getenv("MIN_WIDTH", "500"))
     min_height: int = int(os.getenv("MIN_HEIGHT", "500"))
     min_white_ratio: float = float(os.getenv("MIN_WHITE_RATIO", "0.45"))
-    request_timeout: int = int(os.getenv("REQUEST_TIMEOUT", "20"))
+    request_timeout: int = min(5, int(os.getenv("REQUEST_TIMEOUT", "20"))) if os.getenv('VERCEL') == '1' else int(os.getenv("REQUEST_TIMEOUT", "20"))
     sleep_between_products: float = float(os.getenv("SLEEP_BETWEEN_PRODUCTS", "1.2"))
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_vision_model: str = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")

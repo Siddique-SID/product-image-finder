@@ -1,6 +1,6 @@
 import React,{useState} from 'react';
 export type User={id:string;name:string;email:string};
-export type Session={authenticated:boolean;user:User|null;durable:boolean;registration:boolean;recovery_code?:string};
+export type Session={authenticated:boolean;user:User|null;durable:boolean;registration:boolean;request_processing?:boolean;upload_limit?:number;recovery_code?:string};
 export function Account({onSession}:{onSession:(session:Session)=>void}){
  const [mode,setMode]=useState<'login'|'register'|'recover'|'owner'>('login'),[name,setName]=useState(''),[email,setEmail]=useState(''),[password,setPassword]=useState(''),[code,setCode]=useState(''),[error,setError]=useState(''),[busy,setBusy]=useState(false),[recovery,setRecovery]=useState('');
  async function submit(e:React.FormEvent){e.preventDefault();setBusy(true);setError('');try{
