@@ -153,14 +153,12 @@ Open http://localhost:8000. For frontend development, run `npm run dev` in `fron
 3. Review candidates, their resolution, white border estimate and source page. Approve, reject or upload a replacement.
 4. Export CSV/XLSX reports or a ZIP containing only approved images.
 
-Jobs and review decisions persist under `output/pwa/`. Run one backend worker; jobs are processed sequentially. Interrupted jobs can resume after restart. The PWA caches its interface and viewed candidate images; previously fetched job metadata remains in this browser. Offline uploads and review changes are disabled. Install via the browser's install option (iPhone: Share → Add to Home Screen). Installation requires HTTPS or localhost.
+The customer beta includes owner access, single-use customer invitations, individual accounts, private catalogue libraries and one-time recovery codes. Jobs and images use PostgreSQL when `DATABASE_URL` is configured; local development uses SQLite. Searches run sequentially with pause/resume and retries. CSV, XLSX and approved-image ZIP exports are available, with manual image replacement when automatic search cannot find a match.
 
-This version is intended for a single user on a local machine. Hosted deployments have a password gate; multi-user isolation is not included, so use this as your personal studio. AI verification and Shopify publishing are not wired into the PWA yet. Search uses the existing DuckDuckGo engine and may be rate limited or blocked; unsuccessful products go to manual review. The app uses the supplied green-and-gold Product Image Finder logo with Siddique Sayed attribution for branding, favicon and installation artwork.
+The installable PWA caches its interface only. Private catalogues and images require an internet connection and are never stored in the service-worker cache. Install through Chrome/Edge/Android, or Safari → Share → Add to Home Screen on iPhone.
 
 ### Hosted deployment (Render)
 
-`Dockerfile` builds the frontend and serves it together with the Python API on one HTTPS origin. `render.yaml` deploys the PWA branch, uses one backend worker, generates a session-signing secret and prompts for your private app password. The hosted upload/search API requires a signed login session. Keep the password and session secret in the host environment, never in GitHub.
+The Dockerfile serves the frontend and Python API together. The committed Blueprint keeps the free plan and `REQUIRE_AUTH=true`. Preserve `APP_PASSWORD` and `SESSION_SECRET`. Add an external PostgreSQL `DATABASE_URL` for persistent customer accounts and uploads; without it, the app displays a demo warning because Render Free's filesystem is temporary. No paid services are provisioned by this change.
 
-The included Render configuration uses a free instance for a first demo. Its local data is **ephemeral** and will be lost when the service restarts or redeploys. For durable jobs and images, switch to a paid instance with a persistent disk mounted at `/data` before relying on it for real catalogue work. Image searches also depend on the external search provider accepting hosted traffic. AI verification and Shopify publishing are not enabled by deployment.
-
-Set `REQUIRE_AUTH=true`, `APP_PASSWORD`, and `SESSION_SECRET` for hosted use. Missing credentials stop startup. Local development remains available without authentication when these variables are unset.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for customer invitations, storage setup, limitations and verification. Automatic matching is an estimate and can be blocked by the search provider. Confirm exact variants, pack sizes and image usage rights before publishing. The web app makes no AI API calls and includes no subscription billing or store-publishing integration.
