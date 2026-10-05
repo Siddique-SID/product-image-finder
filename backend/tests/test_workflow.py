@@ -7,6 +7,18 @@ import backend.app as api
 from product_image_finder import Candidate
 
 class Workflow(unittest.TestCase):
+    def test_hosted_password_gate(self):
+        original=api.APP_PASSWORD
+        api.APP_PASSWORD='test-only-password'
+        try:
+            client=TestClient(api.app,base_url='https://example.test')
+            self.assertEqual(client.get('/api/health').status_code,200)
+            self.assertEqual(client.get('/api/jobs').status_code,401)
+            self.assertEqual(client.post('/api/login',json={'password':'wrong'}).status_code,401)
+            self.assertEqual(client.post('/api/login',json={'password':'test-only-password'}).status_code,200)
+            self.assertEqual(client.get('/api/jobs').status_code,200)
+        finally: api.APP_PASSWORD=original
+
     def test_catalogue_review_exports(self):
         with tempfile.TemporaryDirectory() as directory:
             original=api.DATA; api.DATA=Path(directory)

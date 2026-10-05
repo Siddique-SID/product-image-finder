@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: product-image-finder
+    runtime: docker
+    repo: https://github.com/Siddique-SID/product-image-finder
+    branch: feat/product-finder-pwa
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: REQUIRE_AUTH
+        value: "true"
+      - key: APP_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATA_DIR
+        value: /data/pwa

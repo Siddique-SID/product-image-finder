@@ -4,3 +4,5 @@
 
 /* Original supplied brand artwork. */
 .brand{justify-content:center;margin:-12px 0 -25px}.brand img{display:block;width:185px;height:185px;object-fit:contain}.avatar{background:#e8f0ea;color:#166348}.aside-note{padding-top:18px}.brand-mark{display:none}@media(max-width:1100px){.brand img{width:165px;height:165px}}@media(max-width:760px){header:before{content:"";width:45px;height:45px;flex-shrink:0;background:url(/brand-logo.png) center/contain no-repeat}header>span{margin-right:auto;margin-left:9px;font-size:12px}}
+
+.login{max-width:400px;text-align:center}.login img{width:150px;height:150px;object-fit:contain}.login label{display:block;text-align:left;font-size:14px;margin:22px 0}.login input{display:block;width:100%;padding:12px;border:1px solid #c8d8ce;border-radius:8px;margin-top:8px}.login .primary{width:100%}

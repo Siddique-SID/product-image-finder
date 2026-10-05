@@ -155,4 +155,12 @@ Open http://localhost:8000. For frontend development, run `npm run dev` in `fron
 
 Jobs and review decisions persist under `output/pwa/`. Run one backend worker; jobs are processed sequentially. Interrupted jobs can resume after restart. The PWA caches its interface and viewed candidate images; previously fetched job metadata remains in this browser. Offline uploads and review changes are disabled. Install via the browser's install option (iPhone: Share → Add to Home Screen). Installation requires HTTPS or localhost.
 
-This version is intended for a single user on a local machine. It does not include authentication or multi-user isolation and should not be exposed publicly without those additions. AI verification and Shopify publishing are not wired into the PWA yet. Search uses the existing DuckDuckGo engine and may be rate limited or blocked; unsuccessful products go to manual review. The app uses the supplied green-and-gold Product Image Finder logo with Siddique Sayed attribution for branding, favicon and installation artwork.
+This version is intended for a single user on a local machine. Hosted deployments have a password gate; multi-user isolation is not included, so use this as your personal studio. AI verification and Shopify publishing are not wired into the PWA yet. Search uses the existing DuckDuckGo engine and may be rate limited or blocked; unsuccessful products go to manual review. The app uses the supplied green-and-gold Product Image Finder logo with Siddique Sayed attribution for branding, favicon and installation artwork.
+
+### Hosted deployment (Render)
+
+`Dockerfile` builds the frontend and serves it together with the Python API on one HTTPS origin. `render.yaml` deploys the PWA branch, uses one backend worker, generates a session-signing secret and prompts for your private app password. The hosted upload/search API requires a signed login session. Keep the password and session secret in the host environment, never in GitHub.
+
+The included Render configuration uses a free instance for a first demo. Its local data is **ephemeral** and will be lost when the service restarts or redeploys. For durable jobs and images, switch to a paid instance with a persistent disk mounted at `/data` before relying on it for real catalogue work. Image searches also depend on the external search provider accepting hosted traffic. AI verification and Shopify publishing are not enabled by deployment.
+
+Set `REQUIRE_AUTH=true`, `APP_PASSWORD`, and `SESSION_SECRET` for hosted use. Missing credentials stop startup. Local development remains available without authentication when these variables are unset.

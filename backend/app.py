@@ -1,24 +1,57 @@
 """Single-user local PWA backend. Run with one uvicorn worker."""
 from __future__ import annotations
-import json, threading, uuid, zipfile
+import json, threading, uuid, zipfile, os, secrets
 from dataclasses import asdict
 from pathlib import Path
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from product_image_finder import load_products, search_candidates, download_bytes, inspect_image, textual_score, save_image
 from config import SETTINGS
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / 'output' / 'pwa'
+DATA = Path(os.getenv('DATA_DIR', str(ROOT / 'output' / 'pwa')))
 DATA.mkdir(parents=True, exist_ok=True)
 lock = threading.RLock()
 pool = ThreadPoolExecutor(max_workers=1)
 app = FastAPI(title='Product Image Finder by Siddique Sayed')
+APP_PASSWORD = os.getenv('APP_PASSWORD', '')
+REQUIRE_AUTH = os.getenv('REQUIRE_AUTH', '').lower() == 'true'
+if REQUIRE_AUTH and (not APP_PASSWORD or not os.getenv('SESSION_SECRET')):
+    raise RuntimeError('Set APP_PASSWORD and SESSION_SECRET before hosting this app')
+
+@app.middleware('http')
+async def protect_api(request: Request, call_next):
+    if APP_PASSWORD and request.url.path.startswith('/api/') and request.url.path not in ('/api/login', '/api/session', '/api/health'):
+        if not request.session.get('authenticated'):
+            return JSONResponse({'detail': 'Sign in to use your catalogue studio'}, status_code=401)
+    return await call_next(request)
+
+app.add_middleware(SessionMiddleware, secret_key=os.getenv('SESSION_SECRET') or secrets.token_urlsafe(32), https_only=REQUIRE_AUTH, same_site='lax', max_age=86400)
+
+@app.get('/api/health')
+def health(): return {'status': 'ok'}
+
+@app.get('/api/session')
+def session(request: Request):
+    return {'authenticated': not APP_PASSWORD or bool(request.session.get('authenticated'))}
+
+class Login(BaseModel):
+    password: str
+
+@app.post('/api/login')
+def login(credentials: Login, request: Request):
+    if APP_PASSWORD and not secrets.compare_digest(credentials.password.encode(), APP_PASSWORD.encode()):
+        raise HTTPException(401, 'Incorrect password')
+    request.session['authenticated'] = True
+    return {'authenticated': True}
+
 
 def folder(job_id):
     if not job_id.isalnum() or len(job_id) != 32:
