@@ -71,7 +71,7 @@ def normalize_header(value: Any) -> str:
 def find_columns(df: pd.DataFrame) -> tuple[str, str]:
     normalized = {normalize_header(column): column for column in df.columns}
 
-    name_exact = ("productname", "producttitle", "itemname", "itemtitle", "title", "name", "product")
+    name_exact = ("productname", "producttitle", "itemname", "itemtitle", "productdescription", "itemdescription", "description", "title", "name", "product", "item")
     quantity_exact = (
         "quantitypacksize",
         "quantitysize",
@@ -83,6 +83,8 @@ def find_columns(df: pd.DataFrame) -> tuple[str, str]:
         "size",
         "weight",
         "qty",
+        "pack",
+        "volume",
     )
 
     name_col = next((normalized[key] for key in name_exact if key in normalized), None)
@@ -121,12 +123,38 @@ def load_products(path: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"Input file not found: {path.resolve()}")
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        df = pd.read_csv(path)
+        # A catalogue may start with a title or notes before its actual header.
+        # Reading records separately also tolerates a short title record in CSV.
+        import csv
+        with path.open(encoding="utf-8-sig", newline="") as source:
+            raw_sheets = [pd.DataFrame(list(csv.reader(source)))]
     elif suffix in {".xlsx", ".xls"}:
-        df = pd.read_excel(path)
+        raw_sheets = pd.read_excel(path, sheet_name=None, header=None).values()
     else:
         raise ValueError("Input must be .xlsx, .xls or .csv")
-    name_col, qty_col = find_columns(df)
+    df = None
+    for raw in raw_sheets:
+        for header_row in range(min(len(raw), 50)):
+            candidate = raw.iloc[header_row + 1:].copy()
+            candidate.columns = [clean_text(value) for value in raw.iloc[header_row]]
+            # Ignore empty/duplicate headings rather than returning ambiguous
+            # selections from pandas when a merged title spans columns.
+            candidate = candidate.loc[:, (candidate.columns != "") & ~candidate.columns.duplicated()]
+            try:
+                name_col, qty_col = find_columns(candidate)
+            except ValueError:
+                continue
+            if not candidate[name_col].map(clean_text).ne("").any():
+                continue
+            df = candidate
+            break
+        if df is not None:
+            break
+    if df is None:
+        raise ValueError(
+            "Could not identify a product table in the first 50 rows of any sheet. "
+            "Include headers such as Product Name / Item Description and Quantity / Pack Size."
+        )
     out = df[[name_col, qty_col]].copy()
     out.columns = ["Product Name", "Quantity"]
     out["Product Name"] = out["Product Name"].map(clean_text)
