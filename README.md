@@ -126,3 +126,39 @@ rm -f output/reports/*
 ```
 
 Then run the script again.
+
+## PWA studio — by Siddique Sayed
+
+The `feat/product-finder-pwa` branch adds a React + TypeScript customer interface and a FastAPI adapter around the existing search and image-quality functions. The original CLI remains available.
+
+### Run locally
+
+From the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+cd frontend
+npm ci
+npm run build
+cd ..
+python3 -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
+```
+
+Open http://localhost:8000. For frontend development, run `npm run dev` in `frontend/` with the backend still running.
+
+1. Upload a CSV/XLSX with product name and quantity columns (up to 500 products / 10 MB).
+2. Check the detected catalogue before selecting **Find images**.
+3. Review candidates, their resolution, white border estimate and source page. Approve, reject or upload a replacement.
+4. Export CSV/XLSX reports or a ZIP containing only approved images.
+
+The customer beta includes owner access, single-use customer invitations, individual accounts, private catalogue libraries and one-time recovery codes. Jobs and images use PostgreSQL when `DATABASE_URL` is configured; local development uses SQLite. Searches run sequentially with pause/resume and retries. CSV, XLSX and approved-image ZIP exports are available, with manual image replacement when automatic search cannot find a match.
+
+The installable PWA caches its interface only. Private catalogues and images require an internet connection and are never stored in the service-worker cache. Install through Chrome/Edge/Android, or Safari → Share → Add to Home Screen on iPhone.
+
+### Hosted deployment (Render)
+
+The Dockerfile serves the frontend and Python API together. The committed Blueprint keeps the free plan and `REQUIRE_AUTH=true`. Preserve `APP_PASSWORD` and `SESSION_SECRET`. Add an external PostgreSQL `DATABASE_URL` for persistent customer accounts and uploads; without it, the app displays a demo warning because Render Free's filesystem is temporary. No paid services are provisioned by this change.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for customer invitations, storage setup, limitations and verification. Automatic matching is an estimate and can be blocked by the search provider. Confirm exact variants, pack sizes and image usage rights before publishing. The web app makes no AI API calls and includes no subscription billing or store-publishing integration.

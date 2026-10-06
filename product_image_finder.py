@@ -7,10 +7,14 @@ import json
 import re
 import time
 import unicodedata
+import ipaddress
+import socket
+from urllib.parse import urlsplit, urljoin
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -23,6 +27,7 @@ from tqdm import tqdm
 from config import SETTINGS
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = 20_000_000
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 
 
@@ -66,7 +71,7 @@ def normalize_header(value: Any) -> str:
 def find_columns(df: pd.DataFrame) -> tuple[str, str]:
     normalized = {normalize_header(column): column for column in df.columns}
 
-    name_exact = ("productname", "producttitle", "itemname", "itemtitle", "title", "name", "product")
+    name_exact = ("productname", "producttitle", "itemname", "itemtitle", "productdescription", "itemdescription", "description", "title", "name", "product", "item")
     quantity_exact = (
         "quantitypacksize",
         "quantitysize",
@@ -78,6 +83,8 @@ def find_columns(df: pd.DataFrame) -> tuple[str, str]:
         "size",
         "weight",
         "qty",
+        "pack",
+        "volume",
     )
 
     name_col = next((normalized[key] for key in name_exact if key in normalized), None)
@@ -116,12 +123,38 @@ def load_products(path: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"Input file not found: {path.resolve()}")
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        df = pd.read_csv(path)
+        # A catalogue may start with a title or notes before its actual header.
+        # Reading records separately also tolerates a short title record in CSV.
+        import csv
+        with path.open(encoding="utf-8-sig", newline="") as source:
+            raw_sheets = [pd.DataFrame(list(csv.reader(source)))]
     elif suffix in {".xlsx", ".xls"}:
-        df = pd.read_excel(path)
+        raw_sheets = pd.read_excel(path, sheet_name=None, header=None).values()
     else:
         raise ValueError("Input must be .xlsx, .xls or .csv")
-    name_col, qty_col = find_columns(df)
+    df = None
+    for raw in raw_sheets:
+        for header_row in range(min(len(raw), 50)):
+            candidate = raw.iloc[header_row + 1:].copy()
+            candidate.columns = [clean_text(value) for value in raw.iloc[header_row]]
+            # Ignore empty/duplicate headings rather than returning ambiguous
+            # selections from pandas when a merged title spans columns.
+            candidate = candidate.loc[:, (candidate.columns != "") & ~candidate.columns.duplicated()]
+            try:
+                name_col, qty_col = find_columns(candidate)
+            except ValueError:
+                continue
+            if not candidate[name_col].map(clean_text).ne("").any():
+                continue
+            df = candidate
+            break
+        if df is not None:
+            break
+    if df is None:
+        raise ValueError(
+            "Could not identify a product table in the first 50 rows of any sheet. "
+            "Include headers such as Product Name / Item Description and Quantity / Pack Size."
+        )
     out = df[[name_col, qty_col]].copy()
     out.columns = ["Product Name", "Quantity"]
     out["Product Name"] = out["Product Name"].map(clean_text)
@@ -135,10 +168,12 @@ def load_products(path: Path) -> pd.DataFrame:
 def ddg_search(query: str, limit: int) -> list[Candidate]:
     session = requests.Session()
     session.headers.update(HEADERS)
-    html = session.get("https://duckduckgo.com/", params={"q": query}, timeout=SETTINGS.request_timeout).text
+    response = session.get("https://duckduckgo.com/", params={"q": query}, timeout=SETTINGS.request_timeout)
+    response.raise_for_status()
+    html = response.text
     match = re.search(r'vqd=["\']?([\d-]+)', html)
     if not match:
-        return []
+        raise SearchUnavailable('Web image search did not return a search token.')
     params = {"l": "uk-en", "o": "json", "q": query, "vqd": match.group(1), "f": ",,,", "p": "1"}
     response = session.get("https://duckduckgo.com/i.js", params=params, timeout=SETTINGS.request_timeout)
     response.raise_for_status()
@@ -151,41 +186,120 @@ def ddg_search(query: str, limit: int) -> list[Candidate]:
     return candidates
 
 
-def search_candidates(product: str, quantity: str) -> list[Candidate]:
-    queries = [
-        f'"{product}" "{quantity}" product white background',
-        f'"{product}" "{quantity}" packshot',
-        f'{product} {quantity} English packaging',
-        f'{product} {quantity} Arabic packaging',
-        f'{product} {quantity} Urdu packaging',
-    ]
-    seen: set[str] = set()
-    results: list[Candidate] = []
-    for query in queries:
-        try:
-            for item in ddg_search(query, SETTINGS.max_candidates):
-                if item.image_url not in seen:
-                    seen.add(item.image_url)
-                    results.append(item)
-                if len(results) >= SETTINGS.max_candidates:
-                    return results
-        except requests.RequestException:
+class SearchUnavailable(RuntimeError):
+    pass
+
+
+# Public product catalogues: no paid search API or customer credentials.
+CATALOGUE_SOURCES = (
+    'https://swadindia.in', 'https://www.kwfood.co.uk',
+    'https://damasgate.store', 'https://superdokan.com/en-lb',
+)
+
+
+def product_tokens(value: str) -> set[str]:
+    value = unicodedata.normalize('NFKD', value).casefold()
+    value = re.sub(r'\b(?:\d+(?:\.\d+)?)\s*(?:kg|g|ml|l|ltr|litre|liter)\b', ' ', value)
+    return {('sauce' if t == 'sauces' else t) for t in re.findall(r'[a-z]+', value)
+            if t not in {'the', 'and', 'with', 'of', 'product'}}
+
+
+def pack_sizes(value: str) -> set[tuple[float, str]]:
+    sizes = set()
+    for number, unit in re.findall(r'(\d+(?:\.\d+)?)\s*(kg|ml|ltr|litre|liter|g|l)\b', value.casefold()):
+        factor = 1000 if unit in ('kg', 'l', 'ltr', 'litre', 'liter') else 1
+        sizes.add((float(number) * factor, 'g' if unit in ('g', 'kg') else 'ml'))
+    return sizes
+
+
+def catalogue_search(source: str, product: str, quantity: str) -> list[Candidate]:
+    response = requests.get(source + '/search/suggest.json', params={
+        'q': product, 'resources[type]': 'product', 'resources[limit]': 10,
+        'resources[options][fields]': 'title,variants.title',
+    }, headers=HEADERS, timeout=SETTINGS.request_timeout)
+    response.raise_for_status()
+    rows = response.json()['resources']['results']['products']
+    wanted = product_tokens(product)
+    sizes = pack_sizes(quantity)
+    candidates = []
+    for row in rows:
+        title = row.get('title', '')
+        # Predictive search also returns unrelated recommendations. Never accept them.
+        if not wanted or not wanted.issubset(product_tokens(title)):
             continue
-    return results
+        image = row.get('image')
+        if isinstance(image, dict): image = image.get('url') or image.get('src')
+        if not isinstance(image, str) or not image: continue
+        offered = pack_sizes(title)
+        reason = ''
+        if sizes and not sizes.intersection(offered):
+            reason = (f'Pack size differs: source lists {title}; your catalogue requests {quantity}.'
+                      if offered else f'Source pack size is unspecified. Check against {quantity}.')
+        candidates.append(Candidate(image_url=urljoin(source + '/', image),
+            page_url=urljoin(source + '/', row.get('url', '')), title=title,
+            source=urlsplit(source).hostname or 'catalogue', reason=reason))
+    return candidates
+
+
+def search_candidates(product: str, quantity: str) -> list[Candidate]:
+    results = []
+    successful = 0
+    with ThreadPoolExecutor(max_workers=len(CATALOGUE_SOURCES)) as pool:
+        futures = [pool.submit(catalogue_search, source, product, quantity) for source in CATALOGUE_SOURCES]
+        for future in futures:
+            try:
+                results.extend(future.result()); successful += 1
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                continue
+    if not results:
+        try:
+            results = ddg_search(f'{product} {quantity} product', max(8, SETTINGS.max_candidates * 3))
+            successful += 1
+        except (requests.RequestException, ValueError, SearchUnavailable):
+            if not successful:
+                raise SearchUnavailable('Image search providers are unavailable or blocking requests. Retry later or upload an image.')
+            raise SearchUnavailable('No matching image in the supported retailer catalogues, and web image search is blocked or unavailable. Try a more specific product name or upload an image.')
+    results.sort(key=lambda c: (bool(c.reason), len(product_tokens(c.title) - product_tokens(product))))
+    seen = set()
+    unique = []
+    for candidate in results:
+        if candidate.image_url not in seen:
+            seen.add(candidate.image_url); unique.append(candidate)
+    return unique[:min(12, max(8, SETTINGS.max_candidates * 3))]
+
+
+def validate_image_url(url: str) -> None:
+    parts = urlsplit(url)
+    if parts.scheme not in ('http', 'https') or not parts.hostname or parts.username or parts.password:
+        raise ValueError('Use a public HTTP image URL')
+    if parts.port not in (None, 80, 443): raise ValueError('Unsupported image port')
+    addresses = socket.getaddrinfo(parts.hostname, parts.port or (443 if parts.scheme == 'https' else 80), type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(row[4][0]).is_global for row in addresses):
+        raise ValueError('Private network image URLs are not allowed')
 
 
 def download_bytes(url: str) -> bytes:
-    response = requests.get(url, headers=HEADERS, timeout=SETTINGS.request_timeout, allow_redirects=True)
-    response.raise_for_status()
-    if "image" not in response.headers.get("content-type", "").lower():
-        raise ValueError("URL did not return an image")
-    if len(response.content) > 15_000_000:
-        raise ValueError("Image is too large")
-    return response.content
+    for _ in range(5):
+        validate_image_url(url)
+        with requests.get(url, headers=HEADERS, timeout=SETTINGS.request_timeout, allow_redirects=False, stream=True) as response:
+            if response.is_redirect:
+                url = urljoin(url, response.headers.get('location', ''))
+                continue
+            response.raise_for_status()
+            if 'image' not in response.headers.get('content-type', '').lower():
+                raise ValueError('URL did not return an image')
+            raw = bytearray()
+            for chunk in response.iter_content(65536):
+                raw.extend(chunk)
+                if len(raw) > 15_000_000: raise ValueError('Image is too large')
+            return bytes(raw)
+    raise ValueError('Too many image redirects')
 
 
 def inspect_image(raw: bytes) -> tuple[Image.Image, dict[str, float]]:
-    image = Image.open(BytesIO(raw)).convert("RGB")
+    image = Image.open(BytesIO(raw))
+    if image.width * image.height > 20_000_000: raise ValueError("Image exceeds 20 megapixels")
+    image = image.convert("RGB")
     width, height = image.size
     arr = np.asarray(image)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
@@ -280,7 +394,9 @@ def choose_best(product: str, quantity: str) -> tuple[Candidate | None, bytes | 
 
 
 def save_image(raw: bytes, destination: Path) -> None:
-    image = Image.open(BytesIO(raw)).convert("RGB")
+    image = Image.open(BytesIO(raw))
+    if image.width * image.height > 20_000_000: raise ValueError("Image exceeds 20 megapixels")
+    image = image.convert("RGB")
     canvas = Image.new("RGB", image.size, "white")
     canvas.paste(image)
     canvas.save(destination, "JPEG", quality=94, optimize=True)
