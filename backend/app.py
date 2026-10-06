@@ -89,7 +89,9 @@ def app_update():
           await Promise.all(names.filter(n=>n.startsWith('workbox-')||n==='app-pages').map(n=>caches.delete(n)));
         }
         status.textContent='Ready. Open the updated app to invite by email.';
-        this.style.display='none';document.getElementById('open').style.display='inline-block';
+        const open=document.getElementById('open');
+        open.href='/?app-update='+Date.now();
+        this.style.display='none';open.style.display='inline-block';
       }catch(e){status.textContent='Close all app tabs and reopen the app to finish updating.';this.disabled=false}
     };
     </script></body></html>''', headers={'Cache-Control': 'no-store'})
