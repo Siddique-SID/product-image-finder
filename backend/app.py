@@ -11,6 +11,8 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from contextvars import ContextVar
 from backend.storage import Store
@@ -39,7 +41,58 @@ if SERVERLESS and not os.getenv('DATABASE_URL'):
 
 store = Store(DATA / 'studio.sqlite3', os.getenv('DATABASE_URL', ''))
 current_owner = ContextVar('current_owner', default='legacy')
-public_routes = {'/api/login', '/api/register', '/api/recover', '/api/session', '/api/health'}
+public_routes = {'/api/login', '/api/register', '/api/recover', '/api/session', '/api/health', '/api/app-update'}
+
+
+@app.exception_handler(RequestValidationError)
+async def readable_validation(request: Request, error: RequestValidationError):
+    if request.url.path == '/api/invites':
+        message = (
+            'Please use Invite by email and enter a recipient email address. '
+            'If you still see Invite user, update the app at '
+            'https://sid-image-finder.vercel.app/api/app-update'
+        )
+    else:
+        messages = []
+        for item in error.errors():
+            field = str(item['loc'][-1]).replace('_', ' ')
+            text = item['msg']
+            messages.append(f'{field.capitalize()}: {text}')
+        message = '; '.join(messages) or 'Please check the submitted fields.'
+    # Never expose submitted input (which can include passwords) in errors.
+    return JSONResponse({'detail': message}, status_code=422)
+
+
+@app.get('/api/app-update', response_class=HTMLResponse)
+def app_update():
+    return HTMLResponse('''<!doctype html><html lang="en"><head>
+    <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="robots" content="noindex"><title>Update Product Image Finder</title>
+    <style>body{font:18px system-ui;background:#f5f6f8;color:#193b2e;margin:0;padding:24px}
+    main{max-width:540px;margin:12vh auto;background:white;padding:32px;border-radius:20px}
+    button,a{background:#073b2b;color:white;border:0;border-radius:8px;padding:14px 20px;font:inherit;cursor:pointer}
+    a{display:none;text-decoration:none}</style></head><body><main>
+    <h1>Update your app</h1><p>This refreshes the app files saved by your browser.
+    Your account, password and catalogues stay unchanged.</p>
+    <button id="update">Update app</button><p id="status" role="status"></p>
+    <a id="open" href="/">Open updated app</a></main><script>
+    document.getElementById('update').onclick=async function(){
+      this.disabled=true;const status=document.getElementById('status');
+      status.textContent='Updating app files…';
+      try{
+        if('serviceWorker' in navigator){
+          const registrations=await navigator.serviceWorker.getRegistrations();
+          await Promise.all(registrations.map(r=>r.unregister()));
+        }
+        if('caches' in window){
+          const names=await caches.keys();
+          await Promise.all(names.filter(n=>n.startsWith('workbox-')||n==='app-pages').map(n=>caches.delete(n)));
+        }
+        status.textContent='Ready. Open the updated app to invite by email.';
+        this.style.display='none';document.getElementById('open').style.display='inline-block';
+      }catch(e){status.textContent='Close all app tabs and reopen the app to finish updating.';this.disabled=false}
+    };
+    </script></body></html>''', headers={'Cache-Control': 'no-store'})
 
 
 def identity(request):
