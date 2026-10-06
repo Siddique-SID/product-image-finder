@@ -4,6 +4,7 @@ from pathlib import Path
 from io import BytesIO
 from fastapi.testclient import TestClient
 from PIL import Image
+from unittest.mock import patch
 import backend.app as api
 from backend.storage import Store
 from backend import accounts
@@ -81,7 +82,9 @@ class Customers(unittest.TestCase):
         self.assertEqual(a.post(f'/api/jobs/{jid}/start').status_code,409)
         api.run(jid)
         self.assertEqual(a.get(f'/api/jobs/{jid}').json()['status'],'cancelled')
-        self.assertEqual(a.post(f'/api/jobs/{jid}/retry').json()['status'],'ready')
+        with patch.object(api.pool, 'submit') as submit:
+            self.assertEqual(a.post(f'/api/jobs/{jid}/retry').json()['status'],'queued')
+            submit.assert_called_once_with(api.run, jid)
     def test_throttling_and_hashing(self):
         for _ in range(14): self.owner.post('/api/login',json={'password':'wrong'})
         self.assertEqual(self.owner.post('/api/login',json={'password':'wrong'}).status_code,429)

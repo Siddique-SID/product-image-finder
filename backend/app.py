@@ -418,10 +418,18 @@ def retry(job_id: str):
         job = read(job_id)
         if job['status'] not in ('complete', 'interrupted', 'cancelled'):
             raise HTTPException(409, 'Wait for the current search to stop')
-        for p in job['products']:
-            if not p['candidates'] and p['status'] != 'approved': p['status'] = 'pending'
+        if job.get('archived'):
+            raise HTTPException(409, 'Restore this catalogue before searching')
+        missing = [p for p in job['products'] if not p['candidates'] and p['status'] != 'approved']
+        if not missing:
+            raise HTTPException(409, 'Every product already has an image to review')
+        if sum(j['status'] in ('queued', 'running') for j in store.jobs()) >= 20:
+            raise HTTPException(429, 'Search queue is full. Try again shortly.')
+        for p in missing:
+            p.update(status='pending', reason='')
         job['processed'] = sum(p['status'] != 'pending' for p in job['products'])
-        job['status'] = 'ready'; write(job)
+        job['status'] = 'queued'; write(job)
+        if not SERVERLESS: pool.submit(run, job_id)
         return job
 
 @app.post('/api/jobs/{job_id}/archive')

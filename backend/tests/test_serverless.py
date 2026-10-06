@@ -55,3 +55,22 @@ class Serverless(unittest.TestCase):
 
     def test_upload_limit(self):
         self.assertEqual(self.client.post('/api/jobs', files={'file': ('big.csv', b'x' * 4_000_001, 'text/csv')}).status_code, 413)
+
+    def test_retry_restarts_only_missing_products_and_preserves_approvals(self):
+        jid = self.upload()
+        job = api.store.read(jid)
+        job['status'] = 'complete'
+        job['products'][0].update(status='approved', selected=0, candidates=[{'filename':'saved.jpg'}])
+        job['products'][1].update(status='review', reason='Previous search failed')
+        api.store.write(job)
+        with patch.object(api, 'search_candidates', return_value=[]):
+            retry = self.client.post(f'/api/jobs/{jid}/retry').json()
+            self.assertEqual(retry['status'], 'queued')
+            self.assertEqual(retry['processed'], 1)
+            self.assertEqual(retry['products'][1]['reason'], '')
+            completed = self.client.post(f'/api/jobs/{jid}/advance').json()
+        self.assertEqual(completed['status'], 'complete')
+        self.assertEqual(completed['products'][0]['status'], 'approved')
+        completed['archived'] = True
+        api.store.write(completed)
+        self.assertEqual(self.client.post(f'/api/jobs/{jid}/retry').status_code, 409)
