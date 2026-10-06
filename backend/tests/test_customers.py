@@ -1,4 +1,5 @@
 import unittest, tempfile, hashlib, time, zipfile
+from urllib.parse import urlsplit, parse_qs
 from pathlib import Path
 from io import BytesIO
 from fastapi.testclient import TestClient
@@ -22,7 +23,8 @@ class Customers(unittest.TestCase):
         self.temp.cleanup()
     def register(self, email):
         client = TestClient(api.app, base_url='https://studio.test')
-        code=self.owner.post('/api/invites').json()['code']
+        link=self.owner.post('/api/invites',json={'email':email}).json()['link']
+        code=parse_qs(urlsplit(link).fragment)['invite'][0]
         result=client.post('/api/register',json={'name':'Customer', 'email':email,'password':'test-customer-password','access_code':code})
         self.assertEqual(result.status_code,200,result.text)
         return client,result.json()['recovery_code'],code
@@ -49,7 +51,7 @@ class Customers(unittest.TestCase):
         self.assertIn('approved',a.get(f'/api/jobs/{jid}/export/csv').text)
         self.assertEqual(a.get(f'/api/jobs/{jid}/export/xlsx').status_code,200)
         self.assertEqual(a.get('/api/jobs').headers['cache-control'],'private, no-store')
-        self.assertEqual(a.post('/api/invites').status_code,403)
+        self.assertEqual(a.post('/api/invites',json={'email':'c@example.test'}).status_code,403)
     def test_invitation_and_recovery(self):
         a,recovery,code=self.register('a@example.test')
         b=TestClient(api.app,base_url='https://studio.test')

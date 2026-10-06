@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field
 from contextvars import ContextVar
 from backend.storage import Store
 from backend.accounts import hash_password, verify, throttle
+from backend.invitations import invitation_digest, send_invitation
+from urllib.parse import urlencode
 SERVERLESS = os.getenv('VERCEL') == '1'
 if SERVERLESS:
     os.environ.setdefault('MAX_CANDIDATES', '3')
@@ -129,7 +131,7 @@ def register(credentials: Registration, request: Request):
     with lock:
         if store.user(email=email): raise HTTPException(409, 'An account with this email already exists')
         if not credentials.name.strip(): raise HTTPException(400, 'Enter your name')
-        redeemed = store.redeem(hashlib.sha256(credentials.access_code.encode()).hexdigest(), time.time(), uid, email, credentials.name.strip(), hash_password(credentials.password), hash_password(recovery))
+        redeemed = store.redeem(invitation_digest(credentials.access_code, email), time.time(), uid, email, credentials.name.strip(), hash_password(credentials.password), hash_password(recovery))
         if not redeemed: raise HTTPException(403, 'This invitation is invalid, expired or already used')
     request.session.clear()
     request.session.update(user_id=uid, version=1)
@@ -150,13 +152,26 @@ def recover(credentials: Recovery, request: Request):
     request.session.clear()
     return {'recovery_code': recovery}
 
+class Invitation(BaseModel):
+    email: str = Field(max_length=254)
+
 @app.post('/api/invites')
-def invite():
+def invite(recipient: Invitation, request: Request):
     if current_owner.get() != 'legacy' or not APP_PASSWORD:
         raise HTTPException(403, 'Only the studio owner can invite customers')
-    code = secrets.token_urlsafe(24)
-    store.invite(hashlib.sha256(code.encode()).hexdigest(), time.time() + 7 * 86400)
-    return {'code': code, 'expires_days': 7}
+    throttle(request)
+    email = recipient.email.strip().lower()
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
+        raise HTTPException(400, 'Enter a valid email address')
+    if store.user(email=email):
+        raise HTTPException(409, 'This person already has an account. They can sign in.')
+    code = secrets.token_urlsafe(32)
+    store.invite(invitation_digest(code, email), time.time() + 7 * 86400)
+    base = os.getenv('PUBLIC_APP_URL', 'https://sid-image-finder.vercel.app').rstrip('/')
+    # Fragments never reach the web server, preventing tokens in access logs.
+    link = base + '/#' + urlencode({'invite': code, 'email': email})
+    delivery = send_invitation(email, link)
+    return {'email': email, 'link': link, 'delivery': delivery, 'expires_days': 7}
 
 @app.post('/api/logout')
 def logout(request: Request):

@@ -45,3 +45,7 @@ previous deployment or continue using Render; leave the Supabase tables intact.
 Free-tier quotas and inactivity rules still apply. Back up important catalogues.
 
 For optional CLI AI/browser modes, install `requirements-cli.txt` separately.
+
+## Gmail invitations
+
+Owner invitations are tied to the recipient email and expire after seven days. Old generic codes cannot be redeemed. Configure SMTP_GMAIL_USER and SMTP_GMAIL_APP_PASSWORD as server-only Vercel variables, then redeploy. Use a Google app password, never the normal Gmail password. SMTP uses smtp.gmail.com:465 with TLS and certificate verification. PUBLIC_APP_URL may override the canonical signup URL (default https://sid-image-finder.vercel.app). Without credentials, the UI clearly reports unsent and offers a Gmail compose draft or copy link. SMTP errors also report unsent. No paid email service is required.
