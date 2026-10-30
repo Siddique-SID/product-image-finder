@@ -15,6 +15,20 @@ A Python script that reads a product list from Excel or CSV, searches for candid
 
 The script does not blindly accept the first result. Low-quality or non-white-background candidates are rejected and unresolved products are added to `manual_review.xlsx`.
 
+## Visual walkthrough
+
+**Quality gate.** Each candidate image is measured (size, white border, sharpness) and rejected or kept by the thresholds in `.env`. The example below uses synthetic test images, and the numbers come from the real `inspect_image` function.
+
+![Quality gate deciding which candidate images pass](docs/assets/quality_gate.gif)
+
+**Pipeline.** From the product list to the verified image and report.
+
+![Pipeline from product list to verified image](docs/assets/pipeline.gif)
+
+**Command line.** The real `--help` output.
+
+![Command-line help](docs/assets/cli_help.gif)
+
 ## Input format
 
 Both `.xlsx` and `.csv` are supported. The script automatically recognises common column names.
