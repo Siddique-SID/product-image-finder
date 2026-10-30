@@ -17,17 +17,13 @@ The script does not blindly accept the first result. Low-quality or non-white-ba
 
 ## Visual walkthrough
 
-**Quality gate.** Each candidate image is measured (size, white border, sharpness) and rejected or kept by the thresholds in `.env`. The example below uses synthetic test images, and the numbers come from the real `inspect_image` function.
+**Catalogue dashboard (mock-up).** A preview of how the results could look in a review screen. The statuses are illustrative, not real results.
 
-![Quality gate deciding which candidate images pass](docs/assets/quality_gate.gif)
+![Catalogue dashboard mock-up](docs/assets/catalogue_dashboard.gif)
 
-**Pipeline.** From the product list to the verified image and report.
+**How a candidate is scored.** The quality, text-match and AI scores combine into the final score. The example uses synthetic test images, and the numbers come from the project's real scoring functions. The last row shows a known bug: a 150g listing gets a full text score for a 50g request.
 
-![Pipeline from product list to verified image](docs/assets/pipeline.gif)
-
-**Command line.** The real `--help` output.
-
-![Command-line help](docs/assets/cli_help.gif)
+![Score breakdown for three candidate images](docs/assets/score_breakdown.gif)
 
 ## Input format
 
